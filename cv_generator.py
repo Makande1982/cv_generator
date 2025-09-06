@@ -1,11 +1,10 @@
 # cv_generator.py
 # -------------------------------------------------------------
-# SaaS MVP: Generador de CV en PDF (Flask + ReportLab)
-# - Formulario web (HTML+CSS+JS) con bloques dinámicos (agregar/eliminar)
-# - 4 plantillas: classic, twocol, minimal, modern
-# - Foto por URL y QR opcional (a website/LinkedIn)
-# - Stripe Checkout (suscripción Pro mensual/anual) + Webhook
-# - Healthcheck
+# SaaS MVP: Generador de CV + Stripe + Supabase (Postgres)
+# - Flask + ReportLab
+# - 4 plantillas PDF
+# - Checkout Stripe (mensual/anual) + Webhook
+# - Persistencia básica en Supabase (usuarios y suscripciones)
 # -------------------------------------------------------------
 from flask import Flask, request, make_response, render_template_string, jsonify, redirect
 from reportlab.lib.pagesizes import A4
@@ -17,31 +16,79 @@ from reportlab.platypus import (
     Table, TableStyle, Image, FrameBreak, KeepInFrame
 )
 from io import BytesIO
-from datetime import datetime
+from datetime import datetime, timezone
 import requests
 import os
 
-# ===== Opcional: QR =====
+# ===== Opcional: QR
 try:
     import qrcode
 except Exception:
     qrcode = None
 
-# ===== Stripe =====
+# ===== Stripe
 import stripe
 stripe.api_key = os.environ.get("STRIPE_SECRET_KEY", "")
-
 PRICE_MONTHLY = os.environ.get("STRIPE_PRICE_PRO_MONTHLY", "")
 PRICE_YEARLY  = os.environ.get("STRIPE_PRICE_PRO_YEARLY", "")
-WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")  # ponlo cuando crees el webhook
+WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
+
+# ===== Postgres (Supabase)
+import psycopg
+from psycopg.rows import dict_row
+
+DB_URL = os.environ.get("DATABASE_URL", "")
 
 app = Flask(__name__)
 
-# ====================== UTILIDADES ======================
+# ====================== DB helpers ======================
+
+def db():
+    # Conexión simple por petición. (Para más tráfico: usa ConnectionPool de psycopg)
+    return psycopg.connect(DB_URL, row_factory=dict_row)
+
+def upsert_user_by_email(email: str, stripe_customer_id: str | None = None):
+    if not email:
+        return None
+    with db() as conn, conn.cursor() as cur:
+        cur.execute("""
+            insert into app_users (email, stripe_customer_id)
+            values (%s, %s)
+            on conflict (email) do update set
+                stripe_customer_id = coalesce(EXCLUDED.stripe_customer_id, app_users.stripe_customer_id),
+                updated_at = now()
+            returning *;
+        """, (email.lower(), stripe_customer_id))
+        return cur.fetchone()
+
+def set_user_plan(email: str, plan: str):
+    with db() as conn, conn.cursor() as cur:
+        cur.execute("update app_users set plan=%s, updated_at=now() where email=%s returning *;",
+                    (plan, email.lower()))
+        return cur.fetchone()
+
+def get_user_by_email(email: str):
+    with db() as conn, conn.cursor() as cur:
+        cur.execute("select * from app_users where email=%s;", (email.lower(),))
+        return cur.fetchone()
+
+def upsert_subscription(user_id: int, stripe_subscription_id: str, status: str, current_period_end: datetime | None):
+    with db() as conn, conn.cursor() as cur:
+        cur.execute("""
+            insert into subscriptions (user_id, stripe_subscription_id, status, current_period_end)
+            values (%s, %s, %s, %s)
+            on conflict (stripe_subscription_id) do update set
+                status = EXCLUDED.status,
+                current_period_end = EXCLUDED.current_period_end,
+                updated_at = now()
+            returning *;
+        """, (user_id, stripe_subscription_id, status, current_period_end))
+        return cur.fetchone()
+
+# ====================== Utils (PDF) ======================
 
 def build_styles(accent="#0b7285", mono=False):
     styles = getSampleStyleSheet()
-    # base
     if "HeaderSmall" not in styles:
         styles.add(ParagraphStyle(name="HeaderSmall", fontSize=11, leading=14, textColor=colors.HexColor('#666666')))
     else:
@@ -89,7 +136,7 @@ def lines_to_bullets(text: str):
     text = (text or '').replace(';', '\n')
     return [ln.strip() for ln in text.split('\n') if ln.strip()]
 
-# ====================== COLECCIONES ======================
+# ====================== Collectors (form) ======================
 
 def collect_experiences(data: dict):
     titles  = request.form.getlist('exp_title')  or data.get('exp_title',  [])
@@ -103,8 +150,7 @@ def collect_experiences(data: dict):
         c = (comps[i] if i < len(comps) else '').strip()
         d = (dates[i] if i < len(dates) else '').strip()
         ds = (descs[i] if i < len(descs) else '').strip()
-        if any([t, c, d, ds]):
-            out.append((t, c, d, ds))
+        if any([t, c, d, ds]): out.append((t, c, d, ds))
     return out
 
 def collect_education(data: dict):
@@ -117,8 +163,7 @@ def collect_education(data: dict):
         t = (titles[i] if i < len(titles) else '').strip()
         s = (schools[i] if i < len(schools) else '').strip()
         d = (dates[i] if i < len(dates) else '').strip()
-        if any([t, s, d]):
-            out.append((t, s, d))
+        if any([t, s, d]): out.append((t, s, d))
     return out
 
 def collect_skills(data: dict):
@@ -128,9 +173,8 @@ def collect_skills(data: dict):
     raw = (data.get('skills') or '')
     return [s.strip() for s in raw.split(',') if s.strip()]
 
-# ====================== PDFs (4 PLANTILLAS) ======================
+# ====================== Renderers PDF (4 plantillas) ======================
 
-# ---- Clásica ----
 def build_pdf_classic(data: dict, accent="#0b7285") -> bytes:
     buffer = BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=A4, leftMargin=2*cm, rightMargin=2*cm, topMargin=2*cm, bottomMargin=2*cm)
@@ -201,7 +245,6 @@ def build_pdf_classic(data: dict, accent="#0b7285") -> bytes:
     doc.build(story)
     pdf = buffer.getvalue(); buffer.close(); return pdf
 
-# ---- Dos columnas ----
 def build_pdf_twocol(data: dict, accent="#0b7285") -> bytes:
     buffer = BytesIO()
     styles = build_styles(accent=accent)
@@ -277,7 +320,6 @@ def build_pdf_twocol(data: dict, accent="#0b7285") -> bytes:
     doc.build(story)
     pdf = buffer.getvalue(); buffer.close(); return pdf
 
-# ---- Minimal (monocromo) ----
 def build_pdf_minimal(data: dict) -> bytes:
     buffer = BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=A4, leftMargin=2*cm, rightMargin=2*cm, topMargin=2*cm, bottomMargin=2*cm)
@@ -315,7 +357,6 @@ def build_pdf_minimal(data: dict) -> bytes:
     doc.build(story)
     pdf = buffer.getvalue(); buffer.close(); return pdf
 
-# ---- Modern (barra superior a color) ----
 def build_pdf_modern(data: dict, accent="#2563eb") -> bytes:
     buffer = BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=A4, leftMargin=2*cm, rightMargin=2*cm, topMargin=2*cm, bottomMargin=2*cm)
@@ -360,7 +401,7 @@ def build_pdf_modern(data: dict, accent="#2563eb") -> bytes:
     doc.build(story)
     pdf = buffer.getvalue(); buffer.close(); return pdf
 
-# ====================== FORMULARIO (HTML+CSS+JS) ======================
+# ====================== HTML Form (UI) ======================
 
 FORM_HTML = """
 <!doctype html>
@@ -530,7 +571,7 @@ FORM_HTML = """
 </html>
 """
 
-# ====================== RUTAS PRINCIPALES ======================
+# ====================== Rutas principales ======================
 
 @app.get("/")
 def index():
@@ -555,11 +596,10 @@ def generate():
     resp.headers['Content-Disposition'] = f'attachment; filename="{filename}"'
     return resp
 
-# ====================== STRIPE: BILLING + WEBHOOK ======================
+# ====================== Billing (Stripe) ======================
 
 @app.get("/billing")
 def billing_page():
-    # Página de prueba simple para Checkout
     monthly_ok = bool(PRICE_MONTHLY)
     yearly_ok  = bool(PRICE_YEARLY)
     note = "" if (monthly_ok or yearly_ok) else "<p style='color:#b91c1c'>Configura STRIPE_PRICE_PRO_MONTHLY / YEARLY en Render.</p>"
@@ -586,11 +626,15 @@ def billing_page():
 
 @app.post("/create-checkout-session")
 def create_checkout_session():
-    email = request.form.get("email", "").strip()
+    email = request.form.get("email", "").strip().lower()
     plan = request.form.get("price", "monthly").strip().lower()
     price_id = PRICE_MONTHLY if plan == "monthly" else PRICE_YEARLY
     if not stripe.api_key or not price_id:
         return jsonify({"error": "Stripe no está configurado (SECRET_KEY o PRICE_ID)"}), 400
+
+    # Creamos/actualizamos el usuario por email (aún plan 'free' hasta el webhook)
+    if email:
+        upsert_user_by_email(email)
 
     try:
         session = stripe.checkout.Session.create(
@@ -598,6 +642,7 @@ def create_checkout_session():
             payment_method_types=["card"],
             line_items=[{"price": price_id, "quantity": 1}],
             customer_email=email if email else None,
+            client_reference_id=email or None,
             success_url="https://app.aignitionagency.com/success?session_id={CHECKOUT_SESSION_ID}",
             cancel_url="https://app.aignitionagency.com/cancel"
         )
@@ -627,39 +672,83 @@ def cancel():
     </body></html>
     """
 
+# Webhook: activa/baja el plan y registra la suscripción
 @app.post("/webhooks/stripe")
 def stripe_webhook():
-    # Nota: en esta versión no persistimos usuario/plan (no hay BD aún).
-    # Este endpoint valida el evento y sirve de base para cuando añadamos Postgres.
     payload = request.data
     sig_header = request.headers.get("Stripe-Signature", "")
     try:
         if WEBHOOK_SECRET:
             event = stripe.Webhook.construct_event(payload, sig_header, WEBHOOK_SECRET)
         else:
-            # Permite probar sin configurar whsec (NO recomendado en producción)
             event = stripe.Event.construct_from(request.get_json(force=True), stripe.api_key)
     except Exception as e:
         return {"error": str(e)}, 400
 
     etype = event.get("type")
-    # data = event.get("data", {}).get("object", {})  # <- cuando añadamos BD, usaremos estos datos
+    obj = event.get("data", {}).get("object", {})
 
-    # Aquí solo confirmamos recepción
-    if etype in ("checkout.session.completed",
-                 "customer.subscription.updated",
-                 "customer.subscription.deleted"):
-        pass
+    if etype == "checkout.session.completed":
+        # 1) Conseguir email y customer
+        email = (obj.get("customer_details", {}) or {}).get("email") or obj.get("client_reference_id")
+        customer_id = obj.get("customer")
+        if email:
+            user = upsert_user_by_email(email, stripe_customer_id=customer_id)
+            # 2) Buscar subscription ligada a la session
+            sub_id = obj.get("subscription")
+            if sub_id and user:
+                sub = stripe.Subscription.retrieve(sub_id)
+                status = sub.get("status")
+                cpe = sub.get("current_period_end")
+                cpe_dt = datetime.fromtimestamp(cpe, tz=timezone.utc) if cpe else None
+                upsert_subscription(user_id=user["id"], stripe_subscription_id=sub_id, status=status, current_period_end=cpe_dt)
+                # 3) Activar plan en users
+                set_user_plan(email, "pro")
+
+    elif etype == "customer.subscription.updated":
+        sub_id = obj.get("id")
+        status = obj.get("status")
+        cpe = obj.get("current_period_end")
+        cpe_dt = datetime.fromtimestamp(cpe, tz=timezone.utc) if cpe else None
+        customer_id = obj.get("customer")
+        # Encontrar usuario por stripe_customer_id
+        with db() as conn, conn.cursor() as cur:
+            cur.execute("select * from app_users where stripe_customer_id=%s;", (customer_id,))
+            user = cur.fetchone()
+        if user:
+            upsert_subscription(user["id"], sub_id, status, cpe_dt)
+            # Si se canceló, volver a free
+            if status in ("canceled", "unpaid", "incomplete_expired"):
+                set_user_plan(user["email"], "free")
+
+    elif etype == "customer.subscription.deleted":
+        sub_id = obj.get("id")
+        customer_id = obj.get("customer")
+        with db() as conn, conn.cursor() as cur:
+            cur.execute("select * from app_users where stripe_customer_id=%s;", (customer_id,))
+            user = cur.fetchone()
+        if user:
+            upsert_subscription(user["id"], sub_id, "canceled", None)
+            set_user_plan(user["email"], "free")
 
     return {"received": True}, 200
 
-# ====================== HEALTH ======================
+# ====================== Health & Debug ======================
 
 @app.get("/health")
 def health():
     return {"ok": True}
 
-# ====================== DATOS POR DEFECTO ======================
+# Ver plan por email (debug)
+@app.get("/me")
+def me():
+    email = (request.args.get("email") or "").lower().strip()
+    if not email:
+        return {"error": "provide ?email="}, 400
+    u = get_user_by_email(email)
+    return {"user": u}, 200
+
+# ====================== Defaults ======================
 
 def empty_data():
     return {
@@ -696,14 +785,9 @@ def default_data():
         'edu_dates': ['2016 – 2020'],
     }
 
-# ====================== MAIN ======================
-
 if __name__ == '__main__':
-    # Requisitos:
-    # pip install -r requirements.txt
-    # Variables en entorno (Render):
-    #  - STRIPE_SECRET_KEY
-    #  - STRIPE_PRICE_PRO_MONTHLY
-    #  - STRIPE_PRICE_PRO_YEARLY
-    #  - STRIPE_WEBHOOK_SECRET (después de crear webhook)
+    # Env requeridos:
+    #  - DATABASE_URL (Supabase Postgres)
+    #  - STRIPE_SECRET_KEY, STRIPE_PRICE_PRO_MONTHLY, STRIPE_PRICE_PRO_YEARLY
+    #  - STRIPE_WEBHOOK_SECRET (cuando crees el webhook)
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)
